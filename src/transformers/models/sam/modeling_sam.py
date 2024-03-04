@@ -31,6 +31,9 @@ from ...modeling_utils import PreTrainedModel
 from ...utils import ModelOutput, add_start_docstrings, add_start_docstrings_to_model_forward, logging
 from .configuration_sam import SamConfig, SamMaskDecoderConfig, SamPromptEncoderConfig, SamVisionConfig
 
+#Gaudi 2
+import habana_frameworks.torch as ht
+from habana_frameworks.torch.hpex.kernels import FusedSDPA
 
 logger = logging.get_logger(__name__)
 
@@ -71,8 +74,8 @@ class SamVisionEncoderOutput(ModelOutput):
 
     image_embeds: Optional[torch.FloatTensor] = None
     last_hidden_state: torch.FloatTensor = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 
 @dataclass
@@ -106,9 +109,9 @@ class SamImageSegmentationOutput(ModelOutput):
 
     iou_scores: torch.FloatTensor = None
     pred_masks: torch.FloatTensor = None
-    vision_hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    vision_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    mask_decoder_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    vision_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    vision_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    mask_decoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 
 class SamPatchEmbeddings(nn.Module):
@@ -225,11 +228,13 @@ class SamAttention(nn.Module):
         return hidden_states.reshape(batch // point_batch_size, point_batch_size, n_tokens, n_heads * c_per_head)
 
     def forward(self, query: Tensor, key: Tensor, value: Tensor, attention_similarity: Tensor = None) -> Tensor:
+
         # Input projections
         query = self.q_proj(query)
         key = self.k_proj(key)
         value = self.v_proj(value)
 
+      
         point_batch_size = query.shape[1]
         # Separate into heads
         query = self._separate_heads(query, self.num_attention_heads)
@@ -248,6 +253,11 @@ class SamAttention(nn.Module):
 
         # Get output
         out = attn @ value
+
+        # Gaudi 2 patch
+        # with ht.hpu.sdp_kernel(enable_recompute=True):
+        #     out = FusedSDPA.apply(query, key, value, None, 0.0, False) #non-causal
+
         out = self._recombine_heads(out, point_batch_size)
         out = self.out_proj(out)
 
@@ -1195,6 +1205,12 @@ class SamModel(SamPreTrainedModel):
 
         self.post_init()
 
+        #Gaudi patch
+        self.cached_encoder = None
+        self.cached_decoder = None
+        self.ht = ht
+        self.hpu_stream = ht.hpu.Stream()
+
     def get_input_embeddings(self):
         return self.vision_encoder.get_input_embeddings()
 
@@ -1358,13 +1374,31 @@ class SamModel(SamPreTrainedModel):
         vision_hidden_states = None
 
         if pixel_values is not None:
-            vision_outputs = self.vision_encoder(
-                pixel_values,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-            image_embeddings = vision_outputs[0]
+            #Gaudi patch
+            inputs = [pixel_values, output_attentions, output_hidden_states]#, return_dict]
+            if self.cached_encoder == None:
+                with self.ht.hpu.stream(self.hpu_stream):
+                    graph = self.ht.hpu.HPUGraph()
+                    graph.capture_begin()
+                    vision_outputs = self.vision_encoder(
+                        inputs[0],
+                        output_attentions=inputs[1],
+                        output_hidden_states=inputs[2],
+                        return_dict=False,
+                    )[0]
+                    graph.capture_end()
+                    graph_inputs = inputs
+                    graph_outputs = vision_outputs
+                    self.cached_encoder = self.ht.hpu.graphs.CachedParams(graph_inputs, graph_outputs, graph)
+            else:
+                cached = self.cached_encoder
+                self.ht.hpu.graphs.copy_to(cached.graph_inputs, inputs)
+                cached.graph.replay()
+                self.ht.core.hpu.default_stream().synchronize()
+                vision_outputs = cached.graph_outputs
+            image_embeddings = vision_outputs
+            
+            #image_embeddings = vision_outputs[0] # original
 
             if output_hidden_states:
                 vision_hidden_states = vision_outputs[1]
@@ -1390,16 +1424,44 @@ class SamModel(SamPreTrainedModel):
             input_masks=input_masks,
         )
 
-        low_res_masks, iou_predictions, mask_decoder_attentions = self.mask_decoder(
-            image_embeddings=image_embeddings,
-            image_positional_embeddings=image_positional_embeddings,
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=multimask_output,
-            attention_similarity=attention_similarity,
-            target_embedding=target_embedding,
-            output_attentions=output_attentions,
-        )
+        #Gaudi patch
+        inputs = [image_embeddings, image_positional_embeddings, sparse_embeddings, dense_embeddings, multimask_output, attention_similarity, target_embedding, output_attentions]
+        if self.cached_decoder == None:
+            with self.ht.hpu.stream(self.hpu_stream):
+                graph = self.ht.hpu.HPUGraph()
+                graph.capture_begin()
+                low_res_masks, iou_predictions, mask_decoder_attentions = self.mask_decoder(
+                    image_embeddings=inputs[0],
+                    image_positional_embeddings=inputs[1],
+                    sparse_prompt_embeddings=inputs[2],
+                    dense_prompt_embeddings=inputs[3],
+                    multimask_output=inputs[4],
+                    attention_similarity=inputs[5],
+                    target_embedding=inputs[6],
+                    output_attentions=inputs[7],
+                )
+                graph.capture_end()
+                graph_inputs = inputs
+                graph_outputs = [low_res_masks, iou_predictions, mask_decoder_attentions]
+                self.cached_decoder = self.ht.hpu.graphs.CachedParams(graph_inputs, graph_outputs, graph)
+        else:
+            cached = self.cached_decoder
+            self.ht.hpu.graphs.copy_to(cached.graph_inputs, inputs)
+            cached.graph.replay()
+            self.ht.core.hpu.default_stream().synchronize()
+            low_res_masks, iou_predictions, mask_decoder_attentions = cached.graph_outputs[0], cached.graph_outputs[1], cached.graph_outputs[2]
+
+        # Original
+        # low_res_masks, iou_predictions, mask_decoder_attentions = self.mask_decoder(
+        #     image_embeddings=image_embeddings,
+        #     image_positional_embeddings=image_positional_embeddings,
+        #     sparse_prompt_embeddings=sparse_embeddings,
+        #     dense_prompt_embeddings=dense_embeddings,
+        #     multimask_output=multimask_output,
+        #     attention_similarity=attention_similarity,
+        #     target_embedding=target_embedding,
+        #     output_attentions=output_attentions,
+        # )
 
         if not return_dict:
             output = (iou_predictions, low_res_masks)
