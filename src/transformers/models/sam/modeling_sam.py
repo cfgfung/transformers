@@ -863,6 +863,7 @@ class SamVisionAttention(nn.Module):
 
         #Gaudi 2 patch
         #import pdb; pdb.set_trace()
+        #Note: This will slightly change the iou score/accuracy (range within 0.01). Bring about 10% latency improvement
         attn_weights = hpu_kernels.CustomSoftmax.apply(attn_weights, 0).to(query.dtype)
 
         #original
