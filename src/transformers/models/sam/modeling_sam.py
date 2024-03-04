@@ -34,6 +34,7 @@ from .configuration_sam import SamConfig, SamMaskDecoderConfig, SamPromptEncoder
 #Gaudi 2
 import habana_frameworks.torch as ht
 from habana_frameworks.torch.hpex.kernels import FusedSDPA
+import habana_frameworks.torch.hpex.kernels as hpu_kernels
 
 logger = logging.get_logger(__name__)
 
@@ -245,7 +246,10 @@ class SamAttention(nn.Module):
         _, _, _, c_per_head = query.shape
         attn = query @ key.permute(0, 1, 3, 2)  # batch_size * point_batch_size  x N_heads x N_tokens x N_tokens
         attn = attn / math.sqrt(c_per_head)
-        attn = torch.softmax(attn, dim=-1)
+        
+        #Gaudi 2 Patch
+        attn = hpu_kernels.CustomSoftmax.apply(attn, 0)
+        #attn = torch.softmax(attn, dim=-1)
 
         if attention_similarity is not None:
             attn = attn + attention_similarity
@@ -857,7 +861,10 @@ class SamVisionAttention(nn.Module):
                 attn_weights, query, self.rel_pos_h, self.rel_pos_w, (height, width), (height, width)
             )
 
-        attn_weights = torch.nn.functional.softmax(attn_weights, dtype=torch.float32, dim=-1).to(query.dtype)
+        #Gaudi 2 patch
+        attn_weights = hpu_kernels.CustomSoftmax.apply(attn_weights, 1).to(query.dtype)
+
+        #attn_weights = torch.nn.functional.softmax(attn_weights, dtype=torch.float32, dim=-1).to(query.dtype)
 
         attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
